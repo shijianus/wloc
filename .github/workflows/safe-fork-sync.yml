@@ -1,96 +1,118 @@
-# Backup Yu9191/wloc into shijianus/wloc without deletions or force-push.
-# Copy as .github/workflows/safe-fork-sync.yml on the main branch.
-name: Safe upstream sync (additive)
+            | xargs -0 -r git restore --source=HEAD --staged --worktree --
+          # Never let upstream replace this workflow.
+          git restore --source=HEAD --staged --worktree -- \
+            .github/workflows/safe-fork-sync.yml
+          git commit -m 'chore: merge upstream (preserve fork files)'
+          git push origin "HEAD:refs/heads/${BRANCH}"
 
-on:
-  schedule:
-    - cron: '17 */6 * * *' # every 6 hours (UTC)
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-concurrency:
-  group: safe-upstream-sync
-  cancel-in-progress: false
-
-env:
-  UPSTREAM_REPO: Yu9191/wloc
-  BRANCH: main
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fetch upstream, or skip if it is gone
-        id: upstream
-        shell: bash
-        run: |
-          set -euo pipefail
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          if git fetch --no-tags upstream "refs/heads/${BRANCH}"; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'Upstream not reachable; leaving this fork untouched.'
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Merge without deleting fork files
+      - name: Back up missing tags (no force)
         if: steps.upstream.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          trap 'echo "::error::Tag sync failed on line ${LINENO}"' ERR
+          git ls-remote --tags --refs upstream > "$RUNNER_TEMP/upstream-tags.tsv"
+          git ls-remote --tags --refs origin > "$RUNNER_TEMP/fork-tags.tsv"
+          while IFS=$'\t' read -r oid ref; do
+            [[ "$ref" == refs/tags/* ]] || continue
+            fork_oid="$(awk -v r="$ref" '$2 == r {print $1}' "$RUNNER_TEMP/fork-tags.tsv")"
+            if [[ -n "$fork_oid" ]]; then
+              if [[ "$fork_oid" != "$oid" ]]; then
+                echo "::warning::Conflicting tag ${ref}: keeping fork's version."
+              fi
+              continue
+            fi
+            echo "Backing up $ref"
+            git fetch --no-tags upstream "${ref}:${ref}"
+            git push origin "${ref}:${ref}"
+          done < "$RUNNER_TEMP/upstream-tags.tsv"
 
-          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
-            echo 'Upstream already included.'
-            exit 0
-          fi
-
-          # Do not fast-forward or rewrite the fork's history.
-          # If there is a conflict, stop rather than risk overwriting changes.
-          if ! git merge --no-ff --no-commit FETCH_HEAD; then
-            git merge --abort || true
-            echo 'Merge conflict; fork unchanged. Resolve manually.' >&2
-            exit 1
-          fi
-
-          # Re-add tracked files removed by upstream, preserving fork files.
-          git diff --no-renames --name-only --diff-filter=D -z HEAD -- \
-            | xargs -0 -r git restore --source=HEAD --staged --worktree --
-
-          # Protect this workflow from accidental upstream edits.
-          git restore --source=HEAD --staged --worktree -- \
-            .github/workflows/safe-fork-sync.yml
-
-          git commit -m 'chore: merge upstream (preserve fork files)'
-          git push origin "HEAD:refs/heads/${BRANCH}"
-
-      - name: Copy missing tags, releases and release assets
+      - name: Back up published Releases and missing assets
         if: steps.upstream.outputs.available == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          trap 'echo "::error::Release sync failed on line ${LINENO} (exit ${?}). See the command output immediately above."' ERR
 
-          # Tag object IDs are compared so existing, differing tags are untouched.
-          git ls-remote --tags --refs upstream > /tmp/upstream-tags
-          git ls-remote --tags --refs origin > /tmp/fork-tags
+          # Fetch all releases, including pagination. jq -s accepts consecutive JSON arrays.
+          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" > "$RUNNER_TEMP/source-releases.jsonstream"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/fork-releases.jsonstream"
+          jq -s -c '.[][] | select(.draft == false)' "$RUNNER_TEMP/source-releases.jsonstream" > "$RUNNER_TEMP/source-releases.jsonl"
+          jq -s -c '.[][]' "$RUNNER_TEMP/fork-releases.jsonstream" > "$RUNNER_TEMP/fork-releases.jsonl"
+          git ls-remote --tags --refs upstream > "$RUNNER_TEMP/upstream-tags.tsv"
+          git ls-remote --tags --refs origin > "$RUNNER_TEMP/fork-tags.tsv"
 
-          # All tags (even those without a Release): add missing ones only.
-          while IFS=$'\t' read -r upstream_oid ref; do
-            [[ "$ref" == refs/tags/* ]] || continue
-            tag="${ref#refs/tags/}"
-            fork_oid="$(awk -v ref="$ref" '$2 == ref {print $1}' /tmp/fork-tags)"
-            if [[ -n "$fork_oid" && "$fork_oid" != "$upstream_oid" ]]; then
-              echo "Tag conflict: $tag; preserving the fork tag."
+          while IFS= read -r source_release; do
+            [[ -n "$source_release" ]] || continue
+            tag="$(jq -r '.tag_name' <<< "$source_release")"
+            ref="refs/tags/${tag}"
+            upstream_oid="$(awk -v r="$ref" '$2 == r {print $1}' "$RUNNER_TEMP/upstream-tags.tsv")"
+            fork_oid="$(awk -v r="$ref" '$2 == r {print $1}' "$RUNNER_TEMP/fork-tags.tsv")"
+            if [[ -z "$upstream_oid" || -z "$fork_oid" || "$upstream_oid" != "$fork_oid" ]]; then
+              echo "::warning::Release ${tag}: source/destination tags absent or different; skipping safely."
               continue
             fi
-            if [[ -z "$fork_oid" ]]; then
-              git fetch --no-tags upstream "${ref}:${ref}"
+            echo "::group::Release ${tag}"
+            work="$(mktemp -d)"
+            existing="$(jq -c --arg t "$tag" 'select(.tag_name == $t)' "$RUNNER_TEMP/fork-releases.jsonl")"
+            created=false
+            if [[ -z "$existing" ]]; then
+              # Create as a draft so assets can be uploaded before publication.
+              jq -n --arg tag "$tag" \
+                --arg title "$(jq -r '.name // .tag_name' <<< "$source_release")" \
+                --arg body "$(jq -r '.body // ""' <<< "$source_release")" \
+                --argjson prerelease "$(jq -r '.prerelease' <<< "$source_release")" \
+                '{tag_name:$tag,name:$title,body:$body,prerelease:$prerelease,draft:true}' > "$work/create.json"
+              echo "Creating draft release ${tag}"
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" --input "$work/create.json" > "$work/created.json"
+              existing="$(cat "$work/created.json")"
+              created=true
+            else
+              echo "Existing release ${tag}: leave its title, notes and assets unchanged."
+            fi
+
+            # An existing immutable release cannot accept new assets.
+            immutable="$(jq -r '.immutable // false' <<< "$existing")"
+            jq -r '.assets[]?.name' <<< "$existing" > "$work/existing-asset-names"
+            source_asset_count="$(jq -r '.assets | length' <<< "$source_release")"
+            if (( source_asset_count > 0 )); then
+              mkdir -p "$work/assets"
+              missing=false
+              while IFS= read -r filename; do
+                if ! grep -Fxq -- "$filename" "$work/existing-asset-names"; then
+                  missing=true
+                  break
+                fi
+              done < <(jq -r '.assets[].name' <<< "$source_release")
+              if [[ "$missing" == true ]]; then
+                if [[ "$immutable" == true ]]; then
+                  echo "::warning::Release ${tag} is immutable; cannot add missing assets."
+                else
+                  echo "Downloading source assets for ${tag}"
+                  gh release download "$tag" -R "$UPSTREAM_REPO" -D "$work/assets"
+                  for asset in "$work/assets"/*; do
+                    [[ -f "$asset" ]] || continue
+                    filename="${asset##*/}"
+                    if ! grep -Fxq -- "$filename" "$work/existing-asset-names"; then
+                      echo "Uploading missing asset: ${filename}"
+                      gh release upload "$tag" "$asset" -R "$GITHUB_REPOSITORY"
+                    fi
+                  done
+                fi
+              fi
+            fi
+
+            # Publish only releases newly created by this run.
+            if [[ "$created" == true ]]; then
+              printf '{"draft":false}\n' > "$work/publish.json"
+              release_id="$(jq -r '.id' <<< "$existing")"
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+                --input "$work/publish.json" >/dev/null
+              echo "Published backup release ${tag}"
+            fi
+            rm -rf "$work"
+            echo '::endgroup::'
+          done < "$RUNNER_TEMP/source-releases.jsonl"
+          echo 'Release backup finished.'
