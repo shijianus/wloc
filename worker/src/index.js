@@ -1,6 +1,6 @@
 import { Hono } from "hono/tiny";
 import { getPageHtml } from "./page.js";
-import { parseCoords, gcj02ToWgs84, round6 } from "./parse.js";
+import { parseCoords, gcj02ToWgs84, toWgs84, round6, inRange } from "./parse.js";
 
 const app = new Hono();
 
@@ -18,8 +18,13 @@ app.get("/api/parse", async (c) => {
   const fmt = (c.req.query("format") || "").toLowerCase();
   try {
     let { lat, lon, name, src } = await parseCoords(raw);
-    const needConv = cs === "gcj" || (cs !== "none" && (src === "amap" || src === "apple"));
-    if (needConv) ({ lat, lon } = gcj02ToWgs84(lat, lon));
+    // 默认按来源自动换算; cs=none 强制不转换, cs=gcj/bd 强制按指定坐标系转换。
+    if (cs === "gcj") ({ lat, lon } = gcj02ToWgs84(lat, lon));
+    else if (cs === "bd") ({ lat, lon } = toWgs84(lat, lon, "baidu"));
+    else if (cs !== "none") ({ lat, lon } = toWgs84(lat, lon, src));
+    // 出口再校验一次: cs= 是调用方指定的, 强行按错误坐标系换算也可能把值推出值域。
+    // 宁可报错也不要返回一个能被当成坐标写进设备的数字。
+    if (!inRange(lat, lon)) throw new Error("解析出的坐标超出合法范围");
     lat = round6(lat);
     lon = round6(lon);
     name = name || "";
@@ -32,9 +37,68 @@ app.get("/api/parse", async (c) => {
   }
 });
 
+// 全球地点搜索: 供 app 的「全球」模式调用。
+// GET /api/search?q=<关键词>
+//   转发 OpenStreetMap Nominatim, 返回 {results:[{name, detail, lat, lon}]} (均为 WGS-84)。
+//   按关键词边缘缓存 7 天 —— 地名基本不变, 重复搜索不回源, 既快又避开 Nominatim 的限速。
+app.get("/api/search", async (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  const q = (c.req.query("q") || "").trim();
+  if (q.length < 2) return c.json({ results: [] });
+
+  const cache = caches.default;
+  const cacheKey = new Request(
+    `https://wloc.search.cache/?q=${encodeURIComponent(q.toLowerCase())}`
+  );
+  const cached = await cache.match(cacheKey);
+  if (cached) return c.json(await cached.json());
+
+  const api =
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&q=${encodeURIComponent(q)}`;
+  let raw;
+  try {
+    const resp = await fetch(api, {
+      headers: {
+        // Nominatim 使用政策要求标识调用方, 不带会被拒。
+        "User-Agent": "wloc-ios-place-search/1.0",
+        "Accept-Language": "zh-CN,zh,en",
+      },
+    });
+    if (!resp.ok) return c.json({ results: [] });
+    raw = await resp.json();
+  } catch {
+    return c.json({ results: [] });
+  }
+
+  const results = (Array.isArray(raw) ? raw : [])
+    .map((r) => ({
+      name: r.name || String(r.display_name || "").split(",")[0].trim(),
+      detail: r.display_name || "",
+      lat: Number(r.lat),
+      lon: Number(r.lon),
+    }))
+    .filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lon));
+
+  const payload = { results };
+  // 存一份带 TTL 的副本; waitUntil 不阻塞本次返回。
+  c.executionCtx.waitUntil(
+    cache.put(
+      cacheKey,
+      new Response(JSON.stringify(payload), {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "max-age=604800",
+        },
+      })
+    )
+  );
+  return c.json(payload);
+});
+
+// 兜底 500 也要带 CORS —— 否则快捷指令那边看到的是跨域错误, 而不是真正的原因。
 app.onError((e, c) => {
-  console.error(`${e}`);
-  return c.text(`${e}`, 500);
+  c.header("Access-Control-Allow-Origin", "*");
+  return c.text(`${e && e.message ? e.message : e}`, 500);
 });
 
 export default app;
