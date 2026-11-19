@@ -1,96 +1,101 @@
-# Safe, additive backup from Yu9191/wloc into shijianus/wloc.
-# Save as .github/workflows/safe-fork-sync.yml (replace the existing file).
-name: Safe upstream sync (additive)
+name: WLOC safe upstream backup
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '17 */6 * * *'
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: safe-upstream-sync
+  group: wloc-backup
   cancel-in-progress: false
 
-env:
-  UPSTREAM_REPO: Yu9191/wloc
-  BRANCH: main
-  GH_PROMPT_DISABLED: '1'
-  GH_NO_UPDATE_NOTIFIER: '1'
-
 jobs:
-  sync:
+  backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out this fork
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
-      - name: Fetch upstream (skip safely if missing)
-        id: upstream
+      - name: Merge upstream without deleting existing files
         shell: bash
         run: |
           set -euo pipefail
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          if git fetch --no-tags upstream "refs/heads/${BRANCH}"; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-          else
-            echo '::warning::Upstream is missing or unreachable. Fork left unchanged.'
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Merge code without removing tracked files
-        if: steps.upstream.outputs.available == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          trap 'echo "::error::Code sync failed on line ${LINENO}"' ERR
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
-            echo 'Code already includes the upstream tip.'
+          git remote add upstream https://github.com/Yu9191/wloc.git
+          if ! git fetch --no-tags upstream main; then
+            echo '::warning::Upstream unavailable; nothing will be deleted.'
             exit 0
           fi
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo 'No new upstream commits.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if ! git merge --no-ff --no-commit FETCH_HEAD; then
             git merge --abort || true
-            echo '::error::Merge conflict: no changes were pushed.'
+            echo '::error::Merge conflict; fork was not modified remotely.'
             exit 1
           fi
-          # Preserve paths that the incoming merge would remove or rename away.
-          git diff --no-renames --name-only --diff-filter=D -z HEAD -- \
-            | xargs -0 -r git restore --source=HEAD --staged --worktree --
-          # Never let upstream replace this workflow.
-          git restore --source=HEAD --staged --worktree -- \
-            .github/workflows/safe-fork-sync.yml
-          git commit -m 'chore: merge upstream (preserve fork files)'
-          git push origin "HEAD:refs/heads/${BRANCH}"
+          git diff --no-renames --name-only --diff-filter=D -z HEAD -- |
+            xargs -0 -r git restore --source=HEAD --staged --worktree --
+          git restore --source=HEAD --staged --worktree -- .github/workflows/safe-fork-sync.yml
+          git commit -m 'chore: safely merge upstream'
+          git push origin HEAD:main
 
-      - name: Back up missing tags (no force)
-        if: steps.upstream.outputs.available == 'true'
+      - name: Back up new tags, releases and assets
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+          UPSTREAM: Yu9191/wloc
         run: |
           set -euo pipefail
-          trap 'echo "::error::Tag sync failed on line ${LINENO}"' ERR
-          git ls-remote --tags --refs upstream > "$RUNNER_TEMP/upstream-tags.tsv"
-          git ls-remote --tags --refs origin > "$RUNNER_TEMP/fork-tags.tsv"
-          while IFS=$'\t' read -r oid ref; do
-            [[ "$ref" == refs/tags/* ]] || continue
-            fork_oid="$(awk -v r="$ref" '$2 == r {print $1}' "$RUNNER_TEMP/fork-tags.tsv")"
-            if [[ -n "$fork_oid" ]]; then
-              if [[ "$fork_oid" != "$oid" ]]; then
-                echo "::warning::Conflicting tag ${ref}: keeping fork's version."
-              fi
+          if ! git ls-remote upstream HEAD >/dev/null 2>&1; then
+            echo '::warning::Upstream unavailable; skipping tags and releases.'
+            exit 0
+          fi
+          while read -r oid ref; do
+            dest=$(git ls-remote --refs --tags origin "$ref" | awk '{print $1}')
+            if [[ -z "$dest" ]]; then
+              git fetch --no-tags upstream "$ref:$ref"
+              git push origin "$ref:$ref"
+            elif [[ "$dest" != "$oid" ]]; then
+              echo "::warning::Tag conflict: $ref; keeping existing fork tag."
+            fi
+          done < <(git ls-remote --refs --tags upstream)
+
+          while IFS= read -r tag; do
+            ref="refs/tags/$tag"
+            src=$(git ls-remote --refs --tags upstream "$ref" | awk '{print $1}')
+            dst=$(git ls-remote --refs --tags origin "$ref" | awk '{print $1}')
+            if [[ -z "$src" || "$src" != "$dst" ]]; then
+              echo "::warning::Skipping release $tag: source/fork tags differ."
               continue
             fi
-            echo "Backing up $ref"
-            git fetch --no-tags upstream "${ref}:${ref}"
-            git push origin "${ref}:${ref}"
-          done < "$RUNNER_TEMP/upstream-tags.tsv"
-
-      - name: Back up published Releases and missing assets
-        if: steps.upstream.outputs.available == 'true'
-        shell: bash
+            meta=$(gh api "repos/$UPSTREAM/releases/tags/$tag")
+            if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              title=$(jq -r 'if .name == null or .name == "" then .tag_name else .name end' <<< "$meta")
+              dir=$(mktemp -d)
+              jq -r '.body // ""' <<< "$meta" > "$dir/notes.md"
+              args=(-R "$GITHUB_REPOSITORY" --title "$title" --notes-file "$dir/notes.md")
+              if [[ $(jq -r '.prerelease' <<< "$meta") == true ]]; then
+                args+=(--prerelease)
+              fi
+              gh release create "$tag" "${args[@]}"
+              rm -rf "$dir"
+            fi
+            dir=$(mktemp -d)
+            while IFS= read -r asset; do
+              if gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+                  grep -Fxq -- "$asset"; then
+                continue
+              fi
+              gh release download "$tag" -R "$UPSTREAM" -p "$asset" -D "$dir"
+              gh release upload "$tag" "$dir/$asset" -R "$GITHUB_REPOSITORY"
+            done < <(jq -r '.assets[].name' <<< "$meta")
+            rm -rf "$dir"
+          done < <(gh api --paginate "repos/$UPSTREAM/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name')
