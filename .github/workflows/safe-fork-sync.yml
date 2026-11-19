@@ -1,0 +1,96 @@
+# Backup Yu9191/wloc into shijianus/wloc without deletions or force-push.
+# Copy as .github/workflows/safe-fork-sync.yml on the main branch.
+name: Safe upstream sync (additive)
+
+on:
+  schedule:
+    - cron: '17 */6 * * *' # every 6 hours (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: safe-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Yu9191/wloc
+  BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream, or skip if it is gone
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          if git fetch --no-tags upstream "refs/heads/${BRANCH}"; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Upstream not reachable; leaving this fork untouched.'
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge without deleting fork files
+        if: steps.upstream.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo 'Upstream already included.'
+            exit 0
+          fi
+
+          # Do not fast-forward or rewrite the fork's history.
+          # If there is a conflict, stop rather than risk overwriting changes.
+          if ! git merge --no-ff --no-commit FETCH_HEAD; then
+            git merge --abort || true
+            echo 'Merge conflict; fork unchanged. Resolve manually.' >&2
+            exit 1
+          fi
+
+          # Re-add tracked files removed by upstream, preserving fork files.
+          git diff --no-renames --name-only --diff-filter=D -z HEAD -- \
+            | xargs -0 -r git restore --source=HEAD --staged --worktree --
+
+          # Protect this workflow from accidental upstream edits.
+          git restore --source=HEAD --staged --worktree -- \
+            .github/workflows/safe-fork-sync.yml
+
+          git commit -m 'chore: merge upstream (preserve fork files)'
+          git push origin "HEAD:refs/heads/${BRANCH}"
+
+      - name: Copy missing tags, releases and release assets
+        if: steps.upstream.outputs.available == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Tag object IDs are compared so existing, differing tags are untouched.
+          git ls-remote --tags --refs upstream > /tmp/upstream-tags
+          git ls-remote --tags --refs origin > /tmp/fork-tags
+
+          # All tags (even those without a Release): add missing ones only.
+          while IFS=$'\t' read -r upstream_oid ref; do
+            [[ "$ref" == refs/tags/* ]] || continue
+            tag="${ref#refs/tags/}"
+            fork_oid="$(awk -v ref="$ref" '$2 == ref {print $1}' /tmp/fork-tags)"
+            if [[ -n "$fork_oid" && "$fork_oid" != "$upstream_oid" ]]; then
+              echo "Tag conflict: $tag; preserving the fork tag."
+              continue
+            fi
+            if [[ -z "$fork_oid" ]]; then
+              git fetch --no-tags upstream "${ref}:${ref}"
